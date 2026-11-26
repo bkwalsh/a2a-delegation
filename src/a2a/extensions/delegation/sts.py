@@ -127,6 +127,10 @@ class DelegationTokenService:
         self._ttl = ttl_seconds
         self._clock = clock
 
+    def now(self) -> float:
+        """The service's current time."""
+        return self._clock()
+
     @property
     def keys(self) -> KeySet:
         """The public keys that verify tokens from this STS."""
@@ -137,7 +141,12 @@ class DelegationTokenService:
         return {'keys': [self._key.public_jwk()]}
 
     def issue_root_token(
-        self, *, subject: str, audience: str, scopes: Iterable[str]
+        self,
+        *,
+        subject: str,
+        audience: str,
+        scopes: Iterable[str],
+        dpop_jkt: str | None = None,
     ) -> IssuedToken:
         """Issues a depth-0 token after the principal has authenticated.
 
@@ -156,6 +165,7 @@ class DelegationTokenService:
             scopes=granted,
             now=now,
             exp=now + self._ttl,
+            dpop_jkt=dpop_jkt,
         )
 
     def exchange(  # noqa: PLR0913
@@ -167,8 +177,12 @@ class DelegationTokenService:
         audience: str,
         scope: str | None = None,
         subject_token_type: str = ACCESS_TOKEN_TYPE,
+        dpop_jkt: str | None = None,
     ) -> IssuedToken:
         """Performs an RFC 8693 token exchange for ``actor_id``.
+
+        If ``dpop_jkt`` is given (the thumbprint of a key the actor proved it
+        holds), the issued token is bound to that key (RFC 9449 §6).
 
         Raises:
             TokenExchangeError: If any rule in spec §5 is violated.
@@ -235,6 +249,7 @@ class DelegationTokenService:
             scopes=granted,
             now=now,
             exp=min(now + self._ttl, int(subject['exp'])),
+            dpop_jkt=dpop_jkt,
         )
 
     def _issue(
@@ -244,20 +259,24 @@ class DelegationTokenService:
         scopes: frozenset[str],
         now: int,
         exp: int,
+        dpop_jkt: str | None = None,
     ) -> IssuedToken:
         scope = ' '.join(sorted(scopes))
-        token = self._key.sign(
-            {
-                **claims,
-                'iss': self.issuer,
-                'scope': scope,
-                'iat': now,
-                'exp': exp,
-                'jti': new_jti(),
-            }
-        )
+        body = {
+            **claims,
+            'iss': self.issuer,
+            'scope': scope,
+            'iat': now,
+            'exp': exp,
+            'jti': new_jti(),
+        }
+        if dpop_jkt:
+            body['cnf'] = {'jkt': dpop_jkt}
         return IssuedToken(
-            access_token=token, expires_in=max(exp - now, 0), scope=scope
+            access_token=self._key.sign(body),
+            expires_in=max(exp - now, 0),
+            scope=scope,
+            token_type='DPoP' if dpop_jkt else 'Bearer',
         )
 
     def _authenticate(self, agent_id: str, secret: str) -> RegisteredAgent:
@@ -315,7 +334,10 @@ def create_sts_app(
     from starlette.responses import JSONResponse  # noqa: PLC0415
     from starlette.routing import Route  # noqa: PLC0415
 
+    from a2a.extensions.delegation.dpop import ReplayCache  # noqa: PLC0415
+
     no_store = {'Cache-Control': 'no-store'}
+    replay_cache = ReplayCache()
 
     def error(e: TokenExchangeError) -> JSONResponse:
         headers = dict(no_store)
@@ -348,6 +370,28 @@ def create_sts_app(
                 raise TokenExchangeError(
                     'invalid_request', f'{name} is required'
                 )
+        dpop_jkt = None
+        proofs = request.headers.getlist('dpop')
+        if proofs:
+            from a2a.extensions.delegation.dpop import (  # noqa: PLC0415
+                DPoPError,
+                verify_proof,
+            )
+
+            if len(proofs) != 1:
+                raise TokenExchangeError(
+                    'invalid_dpop_proof', 'exactly one DPoP proof is allowed'
+                )
+            try:
+                dpop_jkt = verify_proof(
+                    proofs[0],
+                    method=request.method,
+                    url=str(request.url),
+                    replay_cache=replay_cache,
+                    now=service.now(),
+                ).jkt
+            except DPoPError as e:
+                raise TokenExchangeError('invalid_dpop_proof', str(e)) from e
         return service.exchange(
             actor_id=credentials[0],
             actor_secret=credentials[1],
@@ -357,6 +401,7 @@ def create_sts_app(
             ),
             audience=fields['audience'],
             scope=fields.get('scope') or None,
+            dpop_jkt=dpop_jkt,
         )
 
     async def token(request: Request) -> JSONResponse:
