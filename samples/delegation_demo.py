@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import time
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -35,6 +35,7 @@ from a2a.extensions.delegation.client import (
     TokenExchangeClient,
     forward_context,
 )
+from a2a.extensions.delegation.dpop import DPoPKey, DPoPSigner
 from a2a.extensions.delegation.server import (
     DelegationContextBuilder,
     SkillNotAuthorizedError,
@@ -266,8 +267,18 @@ class Network:
 
     sts: DelegationTokenService
     http: httpx.AsyncClient
+    router: HostRouter
+    dpop: bool = False
+    user_key: DPoPKey = field(default_factory=DPoPKey.generate)
+    agent_keys: dict[str, DPoPKey] = field(default_factory=dict)
     agents: dict[str, ScriptedAgent] = field(default_factory=dict)
-    sts_requests: int = 0
+
+    def agent_http(self, agent_id: str) -> httpx.AsyncClient:
+        """The httpx client an agent uses; signs DPoP requests in DPoP mode."""
+        if not self.dpop:
+            return self.http
+        key = self.agent_keys.setdefault(agent_id, DPoPKey.generate())
+        return httpx.AsyncClient(transport=self.router, auth=DPoPSigner(key))
 
     def exchanger(self, agent_id: str) -> TokenExchangeClient:
         """A token-exchange client authenticated as ``agent_id``."""
@@ -276,36 +287,67 @@ class Network:
             token_endpoint=TOKEN_ENDPOINT,
             client_id=agent_id,
             client_secret=SECRETS[agent_id],
-            http=self.http,
+            http=self.agent_http(agent_id),
+            dpop_key=self.agent_keys.get(agent_id) if self.dpop else None,
         )
 
     def root_token(self, scopes: set[str]) -> str:
-        """What the user's login would produce: a token for the orchestrator."""
+        """What the user's login would produce: a token for the orchestrator.
+
+        In DPoP mode it is bound to the user's key.
+        """
         return self.sts.issue_root_token(
-            subject=USER, audience='agent:orchestrator', scopes=scopes
+            subject=USER,
+            audience='agent:orchestrator',
+            scopes=scopes,
+            dpop_jkt=self.user_key.thumbprint if self.dpop else None,
         ).access_token
 
-    def exchange(self, actor: str, subject_token: str, audience: str) -> str:
+    def exchange(
+        self,
+        actor: str,
+        subject_token: str,
+        audience: str,
+        dpop_key: DPoPKey | None = None,
+    ) -> str:
         """Performs an exchange directly (used to stage attacks)."""
         return self.sts.exchange(
             actor_id=actor,
             actor_secret=SECRETS[actor],
             subject_token=subject_token,
             audience=audience,
+            dpop_jkt=dpop_key.thumbprint if dpop_key else None,
         ).access_token
 
     async def ask(
-        self, agent_id: str, text: str, token: str | None
+        self,
+        agent_id: str,
+        text: str,
+        token: str | None,
+        *,
+        dpop_key: DPoPKey | None = None,
+        dpop_proof: str | None = None,
     ) -> tuple[int, str]:
-        """Sends one message to an agent; returns (HTTP status, outcome)."""
+        """Sends one message to an agent; returns (HTTP status, outcome).
+
+        With ``dpop_key`` (or an explicit, possibly replayed ``dpop_proof``)
+        the token is sent with the DPoP scheme.
+        """
+        url = URLS[agent_id] + '/'
         headers = {
             'A2A-Version': '1.0',
             HTTP_EXTENSION_HEADER: DELEGATION_EXTENSION_URI,
         }
         if token:
-            headers['Authorization'] = f'Bearer {token}'
+            if dpop_key or dpop_proof:
+                headers['Authorization'] = f'DPoP {token}'
+                headers['DPoP'] = dpop_proof or dpop_key.proof(  # type: ignore[union-attr]
+                    'POST', url, access_token=token
+                )
+            else:
+                headers['Authorization'] = f'Bearer {token}'
         r = await self.http.post(
-            URLS[agent_id] + '/',
+            url,
             json={
                 'jsonrpc': '2.0',
                 'id': 1,
@@ -329,8 +371,12 @@ class Network:
         )
 
 
-def build_network() -> Network:
-    """Creates the STS and agents and wires them through one httpx client."""
+def build_network(*, dpop: bool = False) -> Network:
+    """Creates the STS and agents and wires them through one httpx client.
+
+    With ``dpop=True`` every agent requires DPoP-bound tokens, holds its own
+    key, and signs its requests.
+    """
     sts = DelegationTokenService(
         issuer=ISSUER,
         signing_key=SigningKey.generate(),
@@ -366,19 +412,23 @@ def build_network() -> Network:
     router = HostRouter()
     router.add(ISSUER, create_sts_app(sts))
     http = httpx.AsyncClient(transport=router)
-    network = Network(sts=sts, http=http)
+    network = Network(sts=sts, http=http, router=router, dpop=dpop)
     keys = StaticKeySource(sts.keys)
+    orchestrator, travel, payments = (
+        replace(p, dpop_required=dpop) for p in (ORCHESTRATOR, TRAVEL, PAYMENTS)
+    )
     plan = {
         'agent:orchestrator': (
-            ORCHESTRATOR,
-            {'book': Hop(TRAVEL), 'refund': Hop(TRAVEL)},
+            orchestrator,
+            {'book': Hop(travel), 'refund': Hop(travel)},
         ),
-        'agent:travel': (TRAVEL, {'refund': Hop(PAYMENTS, 'payments:refund')}),
-        'agent:payments': (PAYMENTS, {}),
+        'agent:travel': (travel, {'refund': Hop(payments, 'payments:refund')}),
+        'agent:payments': (payments, {}),
     }
     for agent_id, (params, forwards) in plan.items():
+        exchanger = network.exchanger(agent_id)
         agent = ScriptedAgent(
-            params, http, network.exchanger(agent_id), forwards
+            params, network.agent_http(agent_id), exchanger, forwards
         )
         network.agents[agent_id] = agent
         router.add(URLS[agent_id], _app(params, URLS[agent_id], agent, keys))
@@ -615,6 +665,86 @@ async def malicious_card(net: Network) -> Outcome:
     )
 
 
+async def bearer_token_replay(net: Network) -> Outcome:
+    """Without DPoP, a token intercepted in transit can be replayed."""
+    root = net.root_token(ALL_SCOPES)
+    intercepted = net.exchange('agent:orchestrator', root, 'agent:payments')
+    _, observed = await net.ask('agent:payments', 'refund all', intercepted)
+    return Outcome(
+        'Without DPoP: intercepted token replays (known gap)',
+        'TASK_STATE_COMPLETED',
+        observed,
+    )
+
+
+async def legit_refund_dpop(net: Network) -> Outcome:
+    """The 3-hop refund with DPoP-bound tokens at every hop."""
+    _, observed = await net.ask(
+        'agent:orchestrator',
+        'refund booking 42',
+        net.root_token(ALL_SCOPES),
+        dpop_key=net.user_key,
+    )
+    return Outcome(
+        'DPoP: legitimate 3-hop refund',
+        'refund done for user:bayard [agent:payments <- agent:travel <- '
+        'agent:orchestrator]',
+        observed,
+    )
+
+
+async def stolen_dpop_token(net: Network) -> Outcome:
+    """A DPoP-bound token is useless without its holder's private key."""
+    root = net.root_token(ALL_SCOPES)
+    stolen = net.exchange(
+        'agent:orchestrator',
+        root,
+        'agent:payments',
+        dpop_key=net.agent_keys['agent:orchestrator'],
+    )
+    _, as_bearer = await net.ask('agent:payments', 'refund all', stolen)
+    _, own_key = await net.ask(
+        'agent:payments', 'refund all', stolen, dpop_key=DPoPKey.generate()
+    )
+    return Outcome(
+        'DPoP: stolen token (as Bearer / with own key)',
+        '401 invalid_dpop_proof / 401 invalid_dpop_proof',
+        f'{as_bearer} / {own_key}',
+    )
+
+
+async def replayed_dpop_request(net: Network) -> Outcome:
+    """Capturing a whole request (token + proof) and resending it fails."""
+    key = net.agent_keys['agent:orchestrator']
+    root = net.root_token(ALL_SCOPES)
+    token = net.exchange(
+        'agent:orchestrator', root, 'agent:payments', dpop_key=key
+    )
+    proof = key.proof('POST', URLS['agent:payments'] + '/', access_token=token)
+    _, first = await net.ask(
+        'agent:payments', 'refund 1', token, dpop_proof=proof
+    )
+    _, replay = await net.ask(
+        'agent:payments', 'refund 1', token, dpop_proof=proof
+    )
+    return Outcome(
+        'DPoP: captured request replayed',
+        'first TASK_STATE_COMPLETED; replay 401 invalid_dpop_proof',
+        f'first {first.split(":")[0]}; replay {replay}',
+    )
+
+
+DPOP_SCENARIOS = frozenset(
+    {legit_refund_dpop, stolen_dpop_token, replayed_dpop_request}
+)
+"""Scenarios that run against a network requiring DPoP everywhere."""
+
+
+def network_for(scenario: Any) -> Network:
+    """A fresh network in the mode the scenario needs."""
+    return build_network(dpop=scenario in DPOP_SCENARIOS)
+
+
 SCENARIOS = [
     legit_refund,
     booking_only_grant,
@@ -627,6 +757,10 @@ SCENARIOS = [
     untrusted_actor,
     forged_token,
     malicious_card,
+    bearer_token_replay,
+    legit_refund_dpop,
+    stolen_dpop_token,
+    replayed_dpop_request,
 ]
 
 
@@ -634,7 +768,7 @@ async def run_all() -> list[Outcome]:
     """Runs every scenario against a fresh network."""
     outcomes = []
     for scenario in SCENARIOS:
-        net = build_network()
+        net = network_for(scenario)
         async with net.http:
             outcomes.append(await scenario(net))
     return outcomes

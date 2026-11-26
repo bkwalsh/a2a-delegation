@@ -69,6 +69,7 @@ DELEGATION_MODULES = [
     'a2a.extensions.delegation.tokens',
     'a2a.extensions.delegation.sts',
     'a2a.extensions.delegation.client',
+    'a2a.extensions.delegation.dpop',
 ]
 
 SQL_MODULES = [

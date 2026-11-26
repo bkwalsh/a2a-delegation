@@ -81,6 +81,21 @@ tests in `tests/extensions/delegation/test_demo.py`.
 | Registered but untrusted agent in the chain | `trusted_actors` | `403 untrusted_actor` |
 | Token signed with an attacker's key | ES256 signature against the issuer's JWKS | `401 invalid_token` |
 | Card points callers at an attacker's token endpoint | Client is pinned to its own STS | `untrusted_issuer`, no request sent |
+| *Without DPoP:* intercepted token replayed | Nothing (known gap of bearer tokens) | Succeeds until expiry |
+| *With DPoP:* stolen token used as Bearer or with the attacker's key | `cnf.jkt` binding + proof | `401 invalid_dpop_proof` |
+| *With DPoP:* whole request (token + proof) captured and resent | Proof `jti` replay cache | `401 invalid_dpop_proof` |
 
-Bearer tokens can still be replayed by anyone who steals one before it
-expires. Sender-constrained tokens (DPoP, spec §8) close that gap.
+## Sender-constrained tokens (DPoP)
+
+Set `dpop_required=True` on an agent, give each agent a key, and sign its
+outbound requests:
+
+```python
+key = DPoPKey.generate()
+http = httpx.AsyncClient(auth=DPoPSigner(key))          # signs every DPoP request
+exchanger = TokenExchangeClient(..., http=http, dpop_key=key)  # STS binds tokens to key
+```
+
+Each exchange binds the new token to the *calling* agent's key, and every
+request carries a fresh proof for its exact method and URL. Share the
+middleware's `ReplayCache` across replicas in production.

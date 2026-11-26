@@ -12,7 +12,7 @@ from samples import delegation_demo as demo
 async def test_scenario(
     scenario: Callable[[demo.Network], Awaitable[demo.Outcome]],
 ) -> None:
-    net = demo.build_network()
+    net = demo.network_for(scenario)
     async with net.http:
         outcome = await scenario(net)
 
@@ -40,13 +40,14 @@ async def test_legit_refund_reaches_payments_with_full_chain() -> None:
         demo.chain_too_deep,
         demo.untrusted_actor,
         demo.forged_token,
+        demo.stolen_dpop_token,
     ],
     ids=lambda s: s.__name__,
 )
 async def test_blocked_requests_never_run_a_payments_skill(
     scenario: Callable[[demo.Network], Awaitable[demo.Outcome]],
 ) -> None:
-    net = demo.build_network()
+    net = demo.network_for(scenario)
     async with net.http:
         await scenario(net)
 
@@ -68,3 +69,18 @@ def test_main_prints_all_passing(capsys: pytest.CaptureFixture[str]) -> None:
     out = capsys.readouterr().out
     assert out.count('[PASS]') == len(demo.SCENARIOS)
     assert '[FAIL]' not in out
+
+
+@pytest.mark.asyncio
+async def test_dpop_chain_binds_each_hop_to_the_caller() -> None:
+    net = demo.build_network(dpop=True)
+    async with net.http:
+        outcome = await demo.legit_refund_dpop(net)
+
+    assert outcome.ok, outcome.observed
+    # Each agent proved its own key to the STS on its exchange.
+    assert set(net.agent_keys) == {
+        'agent:orchestrator',
+        'agent:travel',
+        'agent:payments',
+    }

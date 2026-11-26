@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     import httpx
 
     from a2a.client.interceptors import AfterArgs, BeforeArgs
+    from a2a.extensions.delegation.dpop import DPoPKey
     from a2a.extensions.delegation.server import DelegatedPrincipal
 
 
@@ -75,6 +76,7 @@ class ExchangedToken:
     access_token: str
     scope: str
     expires_at: float
+    token_type: str = 'Bearer'  # noqa: S105 - OAuth token type
 
 
 class TokenExchangeClient:
@@ -94,8 +96,16 @@ class TokenExchangeClient:
         client_secret: str,
         http: httpx.AsyncClient,
         clock: Callable[[], float] = time.time,
+        dpop_key: DPoPKey | None = None,
     ) -> None:
+        """Creates the client.
+
+        If ``dpop_key`` is set, every exchange proves possession of it and the
+        STS binds issued tokens to it (RFC 9449). The httpx client used for
+        A2A calls must then sign requests with ``DPoPSigner(dpop_key)``.
+        """
         self.issuer = issuer
+        self.dpop_key = dpop_key
         self.token_endpoint = token_endpoint
         self._client_id = client_id
         self._client_secret = client_secret
@@ -142,14 +152,21 @@ class TokenExchangeClient:
         }
         if scope:
             form['scope'] = scope
+        headers = {
+            'Authorization': basic_auth_header(
+                self._client_id, self._client_secret
+            )
+        }
+        if self.dpop_key is not None:
+            from a2a.extensions.delegation.dpop import (  # noqa: PLC0415
+                DPOP_HEADER,
+            )
+
+            headers[DPOP_HEADER] = self.dpop_key.proof(
+                'POST', self.token_endpoint, now=self._clock()
+            )
         response = await self._http.post(
-            self.token_endpoint,
-            data=form,
-            headers={
-                'Authorization': basic_auth_header(
-                    self._client_id, self._client_secret
-                )
-            },
+            self.token_endpoint, data=form, headers=headers
         )
         try:
             body = response.json()
@@ -160,10 +177,16 @@ class TokenExchangeClient:
                 str(body.get('error', f'http_{response.status_code}')),
                 str(body.get('error_description', 'token exchange failed')),
             )
+        token_type = str(body.get('token_type', 'Bearer'))
+        if self.dpop_key is not None and token_type.lower() != 'dpop':
+            raise DelegationForwardingError(
+                'invalid_token_type', 'STS did not bind the token to our key'
+            )
         return ExchangedToken(
             access_token=body['access_token'],
             scope=body.get('scope', ''),
             expires_at=self._clock() + float(body['expires_in']),
+            token_type='DPoP' if token_type.lower() == 'dpop' else 'Bearer',
         )
 
 
@@ -219,7 +242,7 @@ class DelegationInterceptor(ClientCallInterceptor):
             [with_a2a_extensions([DELEGATION_EXTENSION_URI])],
         )
         context.service_parameters['Authorization'] = (
-            f'Bearer {token.access_token}'
+            f'{token.token_type} {token.access_token}'
         )
         args.context = context
 

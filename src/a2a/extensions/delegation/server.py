@@ -29,6 +29,12 @@ from a2a.extensions.common import (
     get_requested_extensions,
 )
 from a2a.extensions.delegation.card import DELEGATION_EXTENSION_URI
+from a2a.extensions.delegation.dpop import (
+    DPOP_HEADER,
+    DPoPError,
+    ReplayCache,
+    verify_proof,
+)
 from a2a.extensions.delegation.tokens import (
     DEFAULT_LEEWAY_SECONDS,
     DelegationTokenError,
@@ -242,11 +248,13 @@ class DelegationAuthBackend(AuthenticationBackend):
         *,
         public_paths: Iterable[str] = (AGENT_CARD_WELL_KNOWN_PATH,),
         leeway: int = DEFAULT_LEEWAY_SECONDS,
+        replay_cache: ReplayCache | None = None,
     ) -> None:
         self._params = params
         self._keys = keys
         self._public_paths = frozenset(public_paths)
         self._leeway = leeway
+        self._replay_cache = replay_cache or ReplayCache()
 
     async def authenticate(
         self, conn: HTTPConnection
@@ -276,10 +284,10 @@ class DelegationAuthBackend(AuthenticationBackend):
                 'extension',
             )
 
-        # 2. A bearer token is present.
-        token = _bearer_token(conn.headers.get('authorization'))
+        # 2. A token is present (Bearer, or DPoP for bound tokens).
+        scheme, token = _auth_token(conn.headers.get('authorization'))
         if token is None:
-            raise DelegationDenied('missing_token', 'no bearer token')
+            raise DelegationDenied('missing_token', 'no delegation token')
 
         # 3-5. Signature, issuer, audience and lifetime.
         claims = await self._verify_token(token)
@@ -300,6 +308,9 @@ class DelegationAuthBackend(AuthenticationBackend):
                     'untrusted_actor', f'untrusted actor {untrusted[0]!r}'
                 )
 
+        # 8. Sender constraint (DPoP, RFC 9449).
+        self._check_dpop(conn, scheme, token, claims)
+
         # 9. The token can invoke at least one skill.
         scopes = scopes_of(claims)
         if not scopes & params.all_scopes:
@@ -316,6 +327,48 @@ class DelegationAuthBackend(AuthenticationBackend):
             token=token,
             claims=claims,
         )
+
+    def _check_dpop(
+        self,
+        conn: HTTPConnection,
+        scheme: str,
+        token: str,
+        claims: dict[str, Any],
+    ) -> None:
+        cnf = claims.get('cnf')
+        jkt = cnf.get('jkt') if isinstance(cnf, dict) else None
+        if jkt is None:
+            if self._params.dpop_required:
+                raise DelegationDenied(
+                    'invalid_dpop_proof', 'token is not DPoP-bound'
+                )
+            if scheme == 'dpop':
+                raise DelegationDenied(
+                    'invalid_dpop_proof', 'DPoP scheme with an unbound token'
+                )
+            return
+        # A bound token is never usable as a plain bearer token, even when
+        # this agent does not require DPoP (RFC 9449 §7.1).
+        if scheme != 'dpop':
+            raise DelegationDenied(
+                'invalid_dpop_proof', 'DPoP-bound token sent as Bearer'
+            )
+        proofs = conn.headers.getlist(DPOP_HEADER)
+        if len(proofs) != 1:
+            raise DelegationDenied(
+                'invalid_dpop_proof', 'exactly one DPoP proof is required'
+            )
+        try:
+            verify_proof(
+                proofs[0],
+                method=str(conn.scope.get('method', '')),
+                url=str(conn.url),
+                access_token=token,
+                expected_jkt=str(jkt),
+                replay_cache=self._replay_cache,
+            )
+        except DPoPError as e:
+            raise DelegationDenied('invalid_dpop_proof', str(e)) from e
 
     async def _verify_token(self, token: str) -> dict[str, Any]:
         keys = await self._keys.get_keys()
@@ -342,13 +395,15 @@ class DelegationAuthBackend(AuthenticationBackend):
         )
 
 
-def _bearer_token(header: str | None) -> str | None:
+def _auth_token(header: str | None) -> tuple[str, str | None]:
+    """Returns (lower-cased scheme, token) for Bearer or DPoP credentials."""
     if not header:
-        return None
+        return '', None
     scheme, _, token = header.partition(' ')
-    if scheme.lower() != 'bearer' or not token.strip():
-        return None
-    return token.strip()
+    scheme = scheme.lower()
+    if scheme not in ('bearer', 'dpop') or not token.strip():
+        return scheme, None
+    return scheme, token.strip()
 
 
 def _audit(
@@ -383,7 +438,12 @@ def delegation_error_response(conn: HTTPConnection, exc: Exception) -> Response:
     if not isinstance(exc, DelegationDenied):
         exc = DelegationDenied('invalid_token', 'authentication failed')
     headers: dict[str, str] = {}
-    if exc.status == _HTTP_UNAUTHORIZED:
+    if exc.code == 'invalid_dpop_proof':
+        headers['WWW-Authenticate'] = (
+            f'DPoP algs="ES256", error="invalid_dpop_proof", '
+            f'error_description="{exc.detail}"'
+        )
+    elif exc.status == _HTTP_UNAUTHORIZED:
         headers['WWW-Authenticate'] = (
             f'Bearer error="invalid_token", error_description="{exc.code}"'
         )
@@ -403,11 +463,18 @@ def delegation_middleware(
     keys: KeySource,
     *,
     public_paths: Iterable[str] = (AGENT_CARD_WELL_KNOWN_PATH,),
+    replay_cache: ReplayCache | None = None,
 ) -> Middleware:
-    """Starlette middleware enforcing the delegation extension."""
+    """Starlette middleware enforcing the delegation extension.
+
+    ``replay_cache`` must be shared across replicas in multi-instance
+    deployments; the default is per process.
+    """
     return Middleware(
         AuthenticationMiddleware,
-        backend=DelegationAuthBackend(params, keys, public_paths=public_paths),
+        backend=DelegationAuthBackend(
+            params, keys, public_paths=public_paths, replay_cache=replay_cache
+        ),
         on_error=delegation_error_response,
     )
 
