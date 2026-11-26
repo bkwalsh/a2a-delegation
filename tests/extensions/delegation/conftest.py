@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 from a2a.extensions.delegation.sts import (
@@ -39,8 +41,9 @@ SECRETS = {
 class Clock:
     """A controllable clock for token lifetimes."""
 
-    def __init__(self, now: float = 1_800_000_000.0) -> None:
-        self.now = now
+    def __init__(self, now: float | None = None) -> None:
+        # Real time, so tokens also verify against receivers' wall clocks.
+        self.now = time.time() if now is None else now
 
     def __call__(self) -> float:
         return self.now

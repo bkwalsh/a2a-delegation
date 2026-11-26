@@ -53,6 +53,13 @@ class DelegationTokenError(Exception):
         self.detail = detail
 
 
+class UnknownKeyError(DelegationTokenError):
+    """The token's ``kid`` is not in the key set (keys may have rotated)."""
+
+    def __init__(self) -> None:
+        super().__init__('invalid_token', 'unknown signing key')
+
+
 def b64url(data: bytes) -> str:
     """Base64url-encodes bytes without padding."""
     return base64.urlsafe_b64encode(data).rstrip(b'=').decode('ascii')
@@ -169,7 +176,7 @@ def verify_token(  # noqa: PLR0913
         )
     key = keys.get(str(header.get('kid', '')))
     if key is None:
-        raise DelegationTokenError('invalid_token', 'unknown signing key')
+        raise UnknownKeyError
     try:
         claims = jwt.decode(
             token,
