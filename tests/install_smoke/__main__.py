@@ -37,6 +37,7 @@ CORE_MODULES = [
     'a2a.utils.task',
     'a2a.helpers.agent_card',
     'a2a.helpers.proto_helpers',
+    'a2a.extensions.delegation',
 ]
 
 HTTP_SERVER_MODULES = [
@@ -64,6 +65,11 @@ TELEMETRY_MODULES = [
     'a2a.utils.telemetry',
 ]
 
+DELEGATION_MODULES = [
+    'a2a.extensions.delegation.tokens',
+    'a2a.extensions.delegation.sts',
+]
+
 SQL_MODULES = [
     'a2a.server.models',
     'a2a.server.tasks.database_task_store',
@@ -78,6 +84,7 @@ PROFILES: dict[str, list[str]] = {
     'grpc': CORE_MODULES + GRPC_MODULES,
     'telemetry': CORE_MODULES + TELEMETRY_MODULES,
     'sql': CORE_MODULES + SQL_MODULES,
+    'delegation': CORE_MODULES + DELEGATION_MODULES,
 }
 
 

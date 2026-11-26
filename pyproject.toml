@@ -41,6 +41,7 @@ telemetry = ["opentelemetry-api>=1.33.0", "opentelemetry-sdk>=1.33.0"]
 postgresql = ["sqlalchemy[asyncio,postgresql-asyncpg]>=2.0.0"]
 mysql = ["sqlalchemy[asyncio,aiomysql]>=2.0.0"]
 signing = ["PyJWT>=2.0.0"]
+delegation = ["PyJWT>=2.0.0", "cryptography>=43.0.0"]
 sqlite = ["sqlalchemy[asyncio,aiosqlite]>=2.0.0"]
 db-cli = ["alembic>=1.14.0"]
 
@@ -54,6 +55,7 @@ all = [
   "a2a-sdk[grpc]",
   "a2a-sdk[telemetry]",
   "a2a-sdk[signing]",
+  "a2a-sdk[delegation]",
   "a2a-sdk[db-cli]",
 ]
 
