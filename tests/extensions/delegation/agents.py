@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from a2a.extensions.delegation import DelegationParams, delegation_extension
 from a2a.extensions.delegation.server import (
@@ -114,6 +114,7 @@ def build_agent_app(
     keys: KeySource,
     url: str,
     executor: AgentExecutor | None = None,
+    **middleware_options: Any,
 ) -> tuple[Starlette, SkillExecutor | AgentExecutor]:
     """A JSON-RPC agent app protected by the delegation middleware."""
     card = agent_card(params, url)
@@ -132,6 +133,6 @@ def build_agent_app(
                 context_builder=DelegationContextBuilder(),
             ),
         ],
-        middleware=[delegation_middleware(params, keys)],
+        middleware=[delegation_middleware(params, keys, **middleware_options)],
     )
     return app, executor

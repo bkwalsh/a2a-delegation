@@ -10,14 +10,21 @@ import base64
 import binascii
 import hashlib
 import hmac
+import json
 import time
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qsl, quote_plus, unquote_plus
 
+import jwt
+
+from cryptography.hazmat.primitives.asymmetric import ec
+from jwt.algorithms import ECAlgorithm
+
 from a2a.extensions.delegation.tokens import (
     ACCESS_TOKEN_TYPE,
+    ALGORITHM,
     TOKEN_EXCHANGE_GRANT,
     DelegationTokenError,
     KeySet,
@@ -35,8 +42,12 @@ if TYPE_CHECKING:
     from starlette.applications import Starlette
     from starlette.requests import Request
 
+    from a2a.extensions.delegation.dpop import ReplayStore
+
 
 DEFAULT_TTL_SECONDS = 300
+MAX_ASSERTION_LIFETIME_SECONDS = 300
+CLIENT_ASSERTION_TYPE = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
 
 
 class TokenExchangeError(Exception):
@@ -59,15 +70,21 @@ class TokenExchangeError(Exception):
 class RegisteredAgent:
     """An agent known to the STS.
 
+    An agent authenticates to the token endpoint with a client secret, or
+    (preferred) with a ``private_key_jwt`` assertion signed by the key whose
+    public half is registered here (RFC 7523 §2.2).
+
     Attributes:
         agent_id: The identifier used as ``aud`` and in ``act.sub``.
-        secret_sha256: SHA-256 hex digest of the agent's client secret.
         accepted_scopes: Scopes this agent may receive as an audience.
+        secret_sha256: SHA-256 hex digest of the agent's client secret.
+        assertion_jwk: Public EC JWK that verifies the agent's assertions.
     """
 
     agent_id: str
-    secret_sha256: str
     accepted_scopes: frozenset[str]
+    secret_sha256: str | None = None
+    assertion_jwk: dict[str, Any] | None = None
 
     @classmethod
     def with_secret(
@@ -80,8 +97,24 @@ class RegisteredAgent:
             accepted_scopes=frozenset(accepted_scopes),
         )
 
+    @classmethod
+    def with_key(
+        cls,
+        agent_id: str,
+        public_jwk: dict[str, Any],
+        accepted_scopes: Iterable[str],
+    ) -> RegisteredAgent:
+        """Registers an agent that authenticates with ``private_key_jwt``."""
+        return cls(
+            agent_id=agent_id,
+            assertion_jwk=dict(public_jwk),
+            accepted_scopes=frozenset(accepted_scopes),
+        )
+
     def check_secret(self, secret: str) -> bool:
         """Constant-time comparison of a presented secret."""
+        if self.secret_sha256 is None:
+            return False
         digest = hashlib.sha256(secret.encode()).hexdigest()
         return hmac.compare_digest(digest, self.secret_sha256)
 
@@ -181,13 +214,46 @@ class DelegationTokenService:
     ) -> IssuedToken:
         """Performs an RFC 8693 token exchange for ``actor_id``.
 
-        If ``dpop_jkt`` is given (the thumbprint of a key the actor proved it
-        holds), the issued token is bound to that key (RFC 9449 §6).
+        Authenticates the actor with a client secret; see
+        :meth:`exchange_for` for actors authenticated another way.
+
+        Raises:
+            TokenExchangeError: If authentication or any rule in spec §5
+                fails.
+        """
+        return self.exchange_for(
+            self.authenticate_secret(actor_id, actor_secret),
+            subject_token=subject_token,
+            audience=audience,
+            scope=scope,
+            subject_token_type=subject_token_type,
+            dpop_jkt=dpop_jkt,
+        )
+
+    def exchange_for(  # noqa: PLR0913
+        self,
+        actor: RegisteredAgent,
+        *,
+        subject_token: str,
+        audience: str,
+        scope: str | None = None,
+        subject_token_type: str = ACCESS_TOKEN_TYPE,
+        dpop_jkt: str | None = None,
+    ) -> IssuedToken:
+        """Performs an RFC 8693 token exchange for an authenticated actor.
+
+        ``actor`` must come from :meth:`authenticate_secret` or
+        :meth:`authenticate_assertion`. If ``dpop_jkt`` is given (the
+        thumbprint of a key the actor proved it holds), the issued token is
+        bound to that key (RFC 9449 §6).
 
         Raises:
             TokenExchangeError: If any rule in spec §5 is violated.
         """
-        actor = self._authenticate(actor_id, actor_secret)
+        if self._agents.get(actor.agent_id) is not actor:
+            raise TokenExchangeError(
+                'invalid_client', 'actor is not a registered agent', 401
+            )
         if subject_token_type != ACCESS_TOKEN_TYPE:
             raise TokenExchangeError(
                 'invalid_request', 'unsupported subject_token_type'
@@ -279,12 +345,88 @@ class DelegationTokenService:
             token_type='DPoP' if dpop_jkt else 'Bearer',
         )
 
-    def _authenticate(self, agent_id: str, secret: str) -> RegisteredAgent:
+    def authenticate_secret(
+        self, agent_id: str, secret: str
+    ) -> RegisteredAgent:
+        """Authenticates an agent by client secret.
+
+        Raises:
+            TokenExchangeError: ``invalid_client`` on any failure.
+        """
         agent = self._agents.get(agent_id)
         if agent is None or not agent.check_secret(secret):
             raise TokenExchangeError(
                 'invalid_client', 'client authentication failed', status=401
             )
+        return agent
+
+    async def authenticate_assertion(
+        self,
+        assertion: str,
+        *,
+        token_url: str,
+        replay_cache: ReplayStore,
+        client_id: str | None = None,
+    ) -> RegisteredAgent:
+        """Authenticates an agent by ``private_key_jwt`` (RFC 7523 §3).
+
+        The assertion must be an ES256 JWT signed by the agent's registered
+        key, with ``iss`` = ``sub`` = the agent id, ``aud`` = this token
+        endpoint, a lifetime of at most five minutes, and a ``jti`` that has
+        not been used before.
+
+        Raises:
+            TokenExchangeError: ``invalid_client`` on any failure.
+        """
+
+        def fail(detail: str) -> TokenExchangeError:
+            return TokenExchangeError('invalid_client', detail, status=401)
+
+        try:
+            unverified = jwt.decode(
+                assertion, options={'verify_signature': False}
+            )
+        except jwt.PyJWTError as e:
+            raise fail('malformed client assertion') from e
+        agent = self._agents.get(str(unverified.get('iss', '')))
+        if agent is None or agent.assertion_jwk is None:
+            raise fail('unknown client or no registered key')
+        key = ECAlgorithm.from_jwk(json.dumps(agent.assertion_jwk))
+        if not isinstance(key, ec.EllipticCurvePublicKey):
+            raise fail('registered key must be a public EC key')
+        now = self._clock()
+        try:
+            claims = jwt.decode(
+                assertion,
+                key,
+                algorithms=[ALGORITHM],
+                audience=token_url,
+                options={
+                    'require': ['iss', 'sub', 'aud', 'exp', 'iat', 'jti'],
+                    'verify_exp': False,
+                    'verify_iat': False,
+                },
+            )
+        except jwt.PyJWTError as e:
+            raise fail(f'invalid client assertion: {e}') from e
+        if claims['sub'] != agent.agent_id:
+            raise fail('assertion sub must equal iss')
+        if client_id is not None and client_id != agent.agent_id:
+            raise fail('client_id does not match the assertion')
+        exp, iat = claims['exp'], claims['iat']
+        if not all(
+            isinstance(v, int | float) and not isinstance(v, bool)
+            for v in (exp, iat)
+        ):
+            raise fail('invalid client assertion: exp and iat must be numbers')
+        if exp <= now or iat > now + 5:
+            raise fail('client assertion expired or not yet valid')
+        if exp - iat > MAX_ASSERTION_LIFETIME_SECONDS:
+            raise fail('client assertion lifetime too long')
+        if not await replay_cache.check_and_add(
+            f'assertion:{claims["jti"]}', exp, now
+        ):
+            raise fail('client assertion has already been used')
         return agent
 
     def _target(self, audience: str) -> RegisteredAgent:
@@ -325,8 +467,22 @@ def create_sts_app(
     *,
     token_path: str = '/token',  # noqa: S107 - a URL path
     jwks_path: str = '/.well-known/jwks.json',
+    token_url: str | None = None,
+    replay_cache: ReplayStore | None = None,
 ) -> Starlette:
     """Builds a Starlette app serving the token endpoint and JWKS.
+
+    Args:
+        service: The token service.
+        token_path: Route of the token endpoint.
+        jwks_path: Route of the JWKS document.
+        token_url: The public URL of the token endpoint. Client assertions
+            must name it as ``aud`` and DPoP proofs as ``htu``. Set it
+            whenever the STS runs behind a proxy; defaults to the URL the
+            server sees.
+        replay_cache: Store for DPoP proof and client assertion ids. Share it
+            across replicas (see ``RedisReplayCache``); defaults to an
+            in-memory cache for a single process.
 
     Requires the ``http-server`` extra.
     """
@@ -334,10 +490,14 @@ def create_sts_app(
     from starlette.responses import JSONResponse  # noqa: PLC0415
     from starlette.routing import Route  # noqa: PLC0415
 
-    from a2a.extensions.delegation.dpop import ReplayCache  # noqa: PLC0415
+    from a2a.extensions.delegation.dpop import (  # noqa: PLC0415
+        DPoPError,
+        ReplayCache,
+        verify_proof,
+    )
 
     no_store = {'Cache-Control': 'no-store'}
-    replay_cache = ReplayCache()
+    replays: ReplayStore = replay_cache or ReplayCache()
 
     def error(e: TokenExchangeError) -> JSONResponse:
         headers = dict(no_store)
@@ -349,18 +509,45 @@ def create_sts_app(
             headers=headers,
         )
 
-    async def exchange(request: Request) -> IssuedToken:
-        credentials = parse_basic_auth(request.headers.get('authorization'))
-        if credentials is None:
+    async def authenticate(
+        request: Request, fields: dict[str, str], url: str
+    ) -> RegisteredAgent:
+        basic = parse_basic_auth(request.headers.get('authorization'))
+        assertion_type = fields.get('client_assertion_type')
+        if assertion_type is not None:
+            if basic is not None:
+                raise TokenExchangeError(
+                    'invalid_request', 'use one client authentication method'
+                )
+            if assertion_type != CLIENT_ASSERTION_TYPE:
+                raise TokenExchangeError(
+                    'invalid_client', 'unsupported client_assertion_type', 401
+                )
+            return await service.authenticate_assertion(
+                fields.get('client_assertion', ''),
+                token_url=url,
+                replay_cache=replays,
+                client_id=fields.get('client_id'),
+            )
+        if basic is None:
             raise TokenExchangeError(
                 'invalid_client', 'client authentication required', 401
             )
+        return service.authenticate_secret(*basic)
+
+    async def exchange(request: Request) -> IssuedToken:
+        url = token_url or str(request.url)
         content_type = request.headers.get('content-type', '')
         if not content_type.startswith('application/x-www-form-urlencoded'):
+            if parse_basic_auth(request.headers.get('authorization')) is None:
+                raise TokenExchangeError(
+                    'invalid_client', 'client authentication required', 401
+                )
             raise TokenExchangeError(
                 'invalid_request', 'body must be form-urlencoded'
             )
         fields = dict(parse_qsl((await request.body()).decode()))
+        actor = await authenticate(request, fields, url)
         if fields.get('grant_type') != TOKEN_EXCHANGE_GRANT:
             raise TokenExchangeError(
                 'unsupported_grant_type', 'only token exchange is supported'
@@ -373,28 +560,23 @@ def create_sts_app(
         dpop_jkt = None
         proofs = request.headers.getlist('dpop')
         if proofs:
-            from a2a.extensions.delegation.dpop import (  # noqa: PLC0415
-                DPoPError,
-                verify_proof,
-            )
-
             if len(proofs) != 1:
                 raise TokenExchangeError(
                     'invalid_dpop_proof', 'exactly one DPoP proof is allowed'
                 )
             try:
-                dpop_jkt = verify_proof(
+                proof = await verify_proof(
                     proofs[0],
                     method=request.method,
-                    url=str(request.url),
-                    replay_cache=replay_cache,
+                    url=url,
+                    replay_cache=replays,
                     now=service.now(),
-                ).jkt
+                )
             except DPoPError as e:
                 raise TokenExchangeError('invalid_dpop_proof', str(e)) from e
-        return service.exchange(
-            actor_id=credentials[0],
-            actor_secret=credentials[1],
+            dpop_jkt = proof.jkt
+        return service.exchange_for(
+            actor,
             subject_token=fields['subject_token'],
             subject_token_type=fields.get(
                 'subject_token_type', ACCESS_TOKEN_TYPE

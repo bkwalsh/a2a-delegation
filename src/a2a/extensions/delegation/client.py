@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from a2a.client.interceptors import AfterArgs, BeforeArgs
     from a2a.extensions.delegation.dpop import DPoPKey
     from a2a.extensions.delegation.server import DelegatedPrincipal
+    from a2a.extensions.delegation.tokens import SigningKey
 
 
 SUBJECT_TOKEN_STATE_KEY = 'delegation_subject_token'  # noqa: S105 - a dict key
@@ -53,6 +54,7 @@ SCOPE_STATE_KEY = 'delegation_scope'
 """Optional ClientCallContext.state key narrowing the forwarded scopes."""
 
 _REFRESH_MARGIN_SECONDS = 10
+_ASSERTION_TTL_SECONDS = 60
 
 
 class DelegationForwardingError(Exception):
@@ -93,17 +95,25 @@ class TokenExchangeClient:
         issuer: str,
         token_endpoint: str,
         client_id: str,
-        client_secret: str,
+        client_secret: str | None = None,
+        client_key: SigningKey | None = None,
         http: httpx.AsyncClient,
         clock: Callable[[], float] = time.time,
         dpop_key: DPoPKey | None = None,
     ) -> None:
         """Creates the client.
 
+        Authenticate with exactly one of ``client_secret`` (HTTP Basic) or
+        ``client_key`` (``private_key_jwt``, RFC 7523; preferred, since no
+        shared secret is sent and each assertion is single-use).
+
         If ``dpop_key`` is set, every exchange proves possession of it and the
         STS binds issued tokens to it (RFC 9449). The httpx client used for
         A2A calls must then sign requests with ``DPoPSigner(dpop_key)``.
         """
+        if (client_secret is None) == (client_key is None):
+            raise ValueError('pass exactly one of client_secret or client_key')
+        self._client_key = client_key
         self.issuer = issuer
         self.dpop_key = dpop_key
         self.token_endpoint = token_endpoint
@@ -141,7 +151,11 @@ class TokenExchangeClient:
         self, subject_token: str, audience: str, scope: str | None
     ) -> ExchangedToken:
         from a2a.extensions.delegation.sts import (  # noqa: PLC0415
+            CLIENT_ASSERTION_TYPE,
             basic_auth_header,
+        )
+        from a2a.extensions.delegation.tokens import (  # noqa: PLC0415
+            new_jti,
         )
 
         form = {
@@ -152,11 +166,25 @@ class TokenExchangeClient:
         }
         if scope:
             form['scope'] = scope
-        headers = {
-            'Authorization': basic_auth_header(
-                self._client_id, self._client_secret
+        headers: dict[str, str] = {}
+        if self._client_key is not None:
+            now = int(self._clock())
+            form['client_id'] = self._client_id
+            form['client_assertion_type'] = CLIENT_ASSERTION_TYPE
+            form['client_assertion'] = self._client_key.sign(
+                {
+                    'iss': self._client_id,
+                    'sub': self._client_id,
+                    'aud': self.token_endpoint,
+                    'iat': now,
+                    'exp': now + _ASSERTION_TTL_SECONDS,
+                    'jti': new_jti(),
+                }
             )
-        }
+        else:
+            headers['Authorization'] = basic_auth_header(
+                self._client_id, self._client_secret or ''
+            )
         if self.dpop_key is not None:
             from a2a.extensions.delegation.dpop import (  # noqa: PLC0415
                 DPOP_HEADER,

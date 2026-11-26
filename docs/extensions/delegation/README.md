@@ -99,3 +99,11 @@ exchanger = TokenExchangeClient(..., http=http, dpop_key=key)  # STS binds token
 Each exchange binds the new token to the *calling* agent's key, and every
 request carries a fresh proof for its exact method and URL. Share the
 middleware's `ReplayCache` across replicas in production.
+
+## Running in production
+
+| Concern | Configure |
+|---|---|
+| Several replicas share one replay store | `delegation_middleware(..., replay_cache=RedisReplayCache(redis))` and `create_sts_app(..., replay_cache=RedisReplayCache(redis))`. The store uses an atomic `SET NX EX`, so a proof or assertion replayed against a *different* replica is still rejected. |
+| No shared secrets at the STS | Register agents with `RegisteredAgent.with_key(agent_id, public_jwk, scopes)` and use `TokenExchangeClient(client_key=SigningKey...)`. Each call sends a single-use, 60-second `private_key_jwt` assertion (RFC 7523). |
+| Services behind a proxy or load balancer | `delegation_middleware(..., public_base_url='https://payments.example.com')` and `create_sts_app(..., token_url='https://sts.example.com/token')`, so DPoP `htu` and assertion `aud` are checked against the public URL the client signed. |
