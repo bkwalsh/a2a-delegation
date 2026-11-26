@@ -1,3 +1,4 @@
+import asyncio
 import time
 
 from typing import Any
@@ -42,12 +43,14 @@ def key() -> DPoPKey:
 
 
 def _verify(proof: str, **kw: Any) -> str:
-    return verify_proof(
-        proof,
-        method=kw.pop('method', 'POST'),
-        url=kw.pop('url', URL),
-        replay_cache=kw.pop('cache', ReplayCache()),
-        **kw,
+    return asyncio.run(
+        verify_proof(
+            proof,
+            method=kw.pop('method', 'POST'),
+            url=kw.pop('url', URL),
+            replay_cache=kw.pop('cache', ReplayCache()),
+            **kw,
+        )
     ).jkt
 
 
@@ -196,11 +199,14 @@ def test_non_numeric_iat_rejected(key: DPoPKey) -> None:
 def test_replay_cache_evicts_expired_and_bounds_size() -> None:
     cache = ReplayCache(max_entries=2)
 
-    assert cache.check_and_add('a', 10, now=0)
-    assert cache.check_and_add('b', 10, now=0)
-    assert cache.check_and_add('c', 10, now=0)  # evicts 'a' (size bound)
-    assert cache.check_and_add('a', 10, now=0)
-    assert cache.check_and_add('b', 30, now=20)  # 'b' had expired
+    def add(jti: str, exp: float, now: float) -> bool:
+        return asyncio.run(cache.check_and_add(jti, exp, now))
+
+    assert add('a', 10, now=0)
+    assert add('b', 10, now=0)
+    assert add('c', 10, now=0)  # evicts 'a' (size bound)
+    assert add('a', 10, now=0)
+    assert add('b', 30, now=20)  # 'b' had expired
 
 
 @pytest.mark.asyncio
@@ -217,9 +223,15 @@ async def test_signer_adds_proof_only_for_dpop_requests(key: DPoPKey) -> None:
         await client.post(URL, headers={'Authorization': 'DPoP tok'})
         await client.post(URL, headers={'Authorization': 'Bearer tok'})
 
-    assert _verify(
-        seen[0].headers['DPoP'], access_token='tok', expected_jkt=key.thumbprint
+    verified = await verify_proof(
+        seen[0].headers['DPoP'],
+        method='POST',
+        url=URL,
+        replay_cache=ReplayCache(),
+        access_token='tok',
+        expected_jkt=key.thumbprint,
     )
+    assert verified.jkt == key.thumbprint
     assert 'DPoP' not in seen[1].headers
 
 

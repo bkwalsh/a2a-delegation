@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from a2a.extensions.delegation.tokens import (
     ALGORITHM,
@@ -116,18 +117,33 @@ class DPoPKey:
         )
 
 
-class ReplayCache:
-    """Remembers proof ``jti`` values until they can no longer be fresh.
+class ReplayStore(Protocol):
+    """Records one-time ids (DPoP proof and client assertion ``jti``).
 
-    In-memory and per process. A deployment with several replicas needs a
-    shared store (for example Redis with TTLs) behind the same interface.
+    Every replica of an agent or STS must share the same store, or a value
+    replayed against a different replica will be accepted.
+    """
+
+    async def check_and_add(
+        self, jti: str, expires_at: float, now: float
+    ) -> bool:
+        """Records ``jti`` until ``expires_at``; False if already recorded."""
+
+
+class ReplayCache:
+    """An in-memory :class:`ReplayStore` for a single process.
+
+    Suitable for tests and single-instance deployments only; use
+    :class:`RedisReplayCache` (or another shared store) with replicas.
     """
 
     def __init__(self, max_entries: int = 100_000) -> None:
         self._seen: OrderedDict[str, float] = OrderedDict()
         self._max = max_entries
 
-    def check_and_add(self, jti: str, expires_at: float, now: float) -> bool:
+    async def check_and_add(
+        self, jti: str, expires_at: float, now: float
+    ) -> bool:
         """Records ``jti``; returns False if it was already seen."""
         while self._seen:
             oldest_jti, oldest_exp = next(iter(self._seen.items()))
@@ -138,6 +154,36 @@ class ReplayCache:
             return False
         self._seen[jti] = expires_at
         return True
+
+
+class _AsyncRedis(Protocol):
+    async def set(
+        self, name: str, value: str, *, nx: bool, ex: int
+    ) -> Any:  # pragma: no cover - interface only
+        """``SET name value NX EX ex`` (redis-py ``redis.asyncio`` API)."""
+
+
+class RedisReplayCache:
+    """A :class:`ReplayStore` shared through Redis.
+
+    Uses an atomic ``SET key 1 NX EX ttl``, so concurrent replicas cannot both
+    accept the same ``jti``. Pass a ``redis.asyncio.Redis`` client (or any
+    object with the same ``set`` signature); redis is not a dependency of this
+    package.
+    """
+
+    def __init__(self, client: _AsyncRedis, prefix: str = 'a2a:jti:') -> None:
+        self._client = client
+        self._prefix = prefix
+
+    async def check_and_add(
+        self, jti: str, expires_at: float, now: float
+    ) -> bool:
+        """Atomically records ``jti``; False if another request already did."""
+        ttl = max(1, math.ceil(expires_at - now))
+        return bool(
+            await self._client.set(self._prefix + jti, '1', nx=True, ex=ttl)
+        )
 
 
 @dataclass(frozen=True)
@@ -179,12 +225,12 @@ def _decode_proof(proof: str) -> tuple[dict[str, Any], dict[str, Any]]:
     return jwk, claims
 
 
-def verify_proof(  # noqa: PLR0913
+async def verify_proof(  # noqa: PLR0913
     proof: str,
     *,
     method: str,
     url: str | httpx.URL,
-    replay_cache: ReplayCache,
+    replay_cache: ReplayStore,
     access_token: str | None = None,
     expected_jkt: str | None = None,
     max_age: int = DEFAULT_MAX_AGE_SECONDS,
@@ -216,7 +262,9 @@ def verify_proof(  # noqa: PLR0913
     if expected_jkt is not None and jkt != expected_jkt:
         raise DPoPError('proof key does not match the token binding')
     # Checked last, so a proof that fails other checks cannot burn its jti.
-    if not replay_cache.check_and_add(str(claims['jti']), iat + max_age, now):
+    if not await replay_cache.check_and_add(
+        str(claims['jti']), iat + max_age, now
+    ):
         raise DPoPError('proof jti has already been used')
     return VerifiedProof(jkt=jkt, jti=str(claims['jti']))
 

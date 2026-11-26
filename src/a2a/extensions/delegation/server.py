@@ -33,6 +33,7 @@ from a2a.extensions.delegation.dpop import (
     DPOP_HEADER,
     DPoPError,
     ReplayCache,
+    ReplayStore,
     verify_proof,
 )
 from a2a.extensions.delegation.tokens import (
@@ -241,15 +242,35 @@ class DelegatedPrincipal(BaseUser):
 class DelegationAuthBackend(AuthenticationBackend):
     """Starlette backend enforcing spec §6 on every non-public request."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         params: DelegationParams,
         keys: KeySource,
         *,
         public_paths: Iterable[str] = (AGENT_CARD_WELL_KNOWN_PATH,),
         leeway: int = DEFAULT_LEEWAY_SECONDS,
-        replay_cache: ReplayCache | None = None,
+        replay_cache: ReplayStore | None = None,
+        public_base_url: str | None = None,
     ) -> None:
+        """Creates the backend.
+
+        Args:
+            params: The agent's declared delegation policy.
+            keys: Source of the issuer's verification keys.
+            public_paths: Paths served without delegation (the Agent Card).
+            leeway: Clock skew tolerated on token times, in seconds.
+            replay_cache: Store for DPoP proof ids. Must be shared by all
+                replicas (see :class:`RedisReplayCache`); defaults to an
+                in-memory cache for a single process.
+            public_base_url: The externally visible origin of this agent,
+                such as ``https://payments.example.com``. Behind a proxy or
+                load balancer the URL the server sees differs from the one
+                the client signed, so set this instead of trusting
+                forwarded headers. Defaults to the request URL.
+        """
+        self._public_base_url = (
+            public_base_url.rstrip('/') if public_base_url else None
+        )
         self._params = params
         self._keys = keys
         self._public_paths = frozenset(public_paths)
@@ -309,7 +330,7 @@ class DelegationAuthBackend(AuthenticationBackend):
                 )
 
         # 8. Sender constraint (DPoP, RFC 9449).
-        self._check_dpop(conn, scheme, token, claims)
+        await self._check_dpop(conn, scheme, token, claims)
 
         # 9. The token can invoke at least one skill.
         scopes = scopes_of(claims)
@@ -328,7 +349,7 @@ class DelegationAuthBackend(AuthenticationBackend):
             claims=claims,
         )
 
-    def _check_dpop(
+    async def _check_dpop(
         self,
         conn: HTTPConnection,
         scheme: str,
@@ -359,16 +380,21 @@ class DelegationAuthBackend(AuthenticationBackend):
                 'invalid_dpop_proof', 'exactly one DPoP proof is required'
             )
         try:
-            verify_proof(
+            await verify_proof(
                 proofs[0],
                 method=str(conn.scope.get('method', '')),
-                url=str(conn.url),
+                url=self._public_url(conn),
                 access_token=token,
                 expected_jkt=str(jkt),
                 replay_cache=self._replay_cache,
             )
         except DPoPError as e:
             raise DelegationDenied('invalid_dpop_proof', str(e)) from e
+
+    def _public_url(self, conn: HTTPConnection) -> str:
+        if self._public_base_url is None:
+            return str(conn.url)
+        return self._public_base_url + conn.url.path
 
     async def _verify_token(self, token: str) -> dict[str, Any]:
         keys = await self._keys.get_keys()
@@ -463,17 +489,22 @@ def delegation_middleware(
     keys: KeySource,
     *,
     public_paths: Iterable[str] = (AGENT_CARD_WELL_KNOWN_PATH,),
-    replay_cache: ReplayCache | None = None,
+    replay_cache: ReplayStore | None = None,
+    public_base_url: str | None = None,
 ) -> Middleware:
     """Starlette middleware enforcing the delegation extension.
 
-    ``replay_cache`` must be shared across replicas in multi-instance
-    deployments; the default is per process.
+    See :class:`DelegationAuthBackend` for ``replay_cache`` (share it across
+    replicas) and ``public_base_url`` (set it behind a proxy).
     """
     return Middleware(
         AuthenticationMiddleware,
         backend=DelegationAuthBackend(
-            params, keys, public_paths=public_paths, replay_cache=replay_cache
+            params,
+            keys,
+            public_paths=public_paths,
+            replay_cache=replay_cache,
+            public_base_url=public_base_url,
         ),
         on_error=delegation_error_response,
     )
