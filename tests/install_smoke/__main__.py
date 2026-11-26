@@ -68,6 +68,7 @@ TELEMETRY_MODULES = [
 DELEGATION_MODULES = [
     'a2a.extensions.delegation.tokens',
     'a2a.extensions.delegation.sts',
+    'a2a.extensions.delegation.client',
 ]
 
 SQL_MODULES = [
